@@ -1,112 +1,87 @@
-name: Build FFmpeg for Android
+name: Stage 2 - Package FFmpeg for Android
 
 on:
   workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run ID of Stage 1 (leave blank to use latest successful run)'
+        required: false
+        default: ''
 
 jobs:
-  build:
+  package:
     runs-on: ubuntu-latest
-
     strategy:
       fail-fast: false
       matrix:
         arch: [aarch64, arm, i686, x86_64]
 
     steps:
-      - name: Free Disk Space (Prevent Out-Of-Disk Crashes)
-        shell: bash
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y binutils zip
 
-      - name: Checkout Termux build system
-        uses: actions/checkout@v4
+      # Grabs the artifact from Stage 1 automatically
+      - name: Download Stage 1 deb artifacts
+        uses: dawidd6/action-download-artifact@v6
         with:
-          repository: termux/termux-packages
-          # Pin to a known stable commit or tag instead of unstable master
-          # Replace with a specific commit hash if master breaks often
-          ref: master
-          fetch-depth: 1
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: stage-1-ffmpeg-.yml  # <-- Set this to your Stage 1 file name (e.g. stage1.yml)
+          workflow_conclusion: success
+          run_id: ${{ inputs.run_id }}       # Uses input if specified, otherwise latest success
+          name: ffmpeg-${{ matrix.arch }}
+          path: debs/
 
-      - name: Build FFmpeg
+      - name: Extract debs and prepare Android .so files
         shell: bash
         run: |
-          # 1. Create a bulletproof build runner script
-          cat > build-ffmpeg.sh <<'SCRIPT'
-          #!/bin/bash
-          set -e
-          export TERMUX_ARCH="${{ matrix.arch }}"
-          export TERMUX_PREFIX=/data/youtubedl-android/usr
-          export TERMUX_ANDROID_HOME=/data/youtubedl-android/home
+          mkdir -p extracted staging staging_zip/usr/lib final_output
 
-          # -s: Skip checksum verification (fixes rotating/dirty mirror hashes)
-          # -I: Install dependencies via binary packages if possible (speeds up build)
-          ./build-package.sh -s ffmpeg
-          SCRIPT
+          echo "Deb packages found:"
+          ls -la debs/
 
-          chmod +x build-ffmpeg.sh
+          # 1. Extract all .deb files from Stage 1
+          find debs/ -type f -name "*.deb" -exec dpkg-deb -x {} extracted/ \;
 
-          # 2. Clean environment
-          ./scripts/run-docker.sh ./clean.sh
-
-          # 3. Run build with log redirection to prevent browser-crashing logs
-          echo "::group::Building FFmpeg for ${{ matrix.arch }} (Hiding compiler spam)..."
-          
-          set +e
-          ./scripts/run-docker.sh ./build-ffmpeg.sh > build.log 2>&1
-          BUILD_EXIT_CODE=$?
-          echo "::endgroup::"
-
-          # 4. Handle failure intelligently
-          if [ $BUILD_EXIT_CODE -ne 0 ]; then
-            echo "BUILD FAILED for ${{ matrix.arch }} with exit code $BUILD_EXIT_CODE!"
-            echo "====================== RECENT ERROR LOGS ======================"
-            # Print the last 150 lines to find the immediate problem
-            tail -n 150 build.log
-            echo "==============================================================="
-            echo "::error::Build failed! Full logs saved as artifact."
-            exit $BUILD_EXIT_CODE
-          else
-            echo "Build completed successfully for ${{ matrix.arch }}!"
+          # 2. Locate the Termux usr folder
+          USR_DIR="extracted/data/data/com.termux/files/usr"
+          if [ ! -d "$USR_DIR" ]; then
+            echo "Fallback: finding usr folder dynamically..."
+            USR_DIR=$(find extracted -type d -name "usr" | head -n 1)
           fi
+          echo "Using USR_DIR: $USR_DIR"
 
-      - name: Upload Build Log on Failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-${{ matrix.arch }}
-          path: build.log
-          retention-days: 3
-
-      - name: Extract FFmpeg packages
-        shell: bash
-        run: |
-          mkdir -p extracted
-          
-          # Find all deb packages built
-          find debs -type f -name '*.deb' \
-            ! -name '*-dev_*.deb' \
-            ! -name '*-static_*.deb' \
-            -exec dpkg-deb -x '{}' extracted/ \;
-
-          mkdir -p output
-          
-          TARGET_DIR="extracted/data/youtubedl-android"
-          if [ ! -d "$TARGET_DIR" ]; then
-            echo "::error::Target output directory $TARGET_DIR does not exist. Check deb outputs."
-            ls -la debs/
+          # 3. Create libffmpeg.so and libffprobe.so
+          if [ ! -f "$USR_DIR/bin/ffmpeg" ]; then
+            echo "::error::ffmpeg binary not found in $USR_DIR/bin/"
             exit 1
           fi
 
-          cd "$TARGET_DIR"
-          rm -rf usr/share/man
-          zip -y -r "$GITHUB_WORKSPACE/output/ffmpeg-${{ matrix.arch }}.zip" usr/
+          cp "$USR_DIR/bin/ffmpeg" staging/libffmpeg.so
+          cp "$USR_DIR/bin/ffprobe" staging/libffprobe.so
 
-      - name: Upload FFmpeg archive
+          # Strip debug symbols to reduce APK size significantly
+          strip --strip-unneeded staging/libffmpeg.so staging/libffprobe.so || true
+
+          # 4. Create libffmpeg.zip.so containing runtime shared libraries
+          if [ -d "$USR_DIR/lib" ]; then
+            cp -P "$USR_DIR"/lib/*.so* staging_zip/usr/lib/ 2>/dev/null || true
+          fi
+
+          cd staging_zip
+          zip -y -r ../staging/libffmpeg.zip.so usr/
+          cd ..
+
+          # 5. Move final artifacts to destination
+          cp staging/libffmpeg.so final_output/
+          cp staging/libffprobe.so final_output/
+          cp staging/libffmpeg.zip.so final_output/
+
+          echo "Final packaged files:"
+          ls -lh final_output/
+
+      - name: Upload Native Android Binaries (.so)
         uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-${{ matrix.arch }}
-          path: output/*.zip
+          name: ffmpeg-android-${{ matrix.arch }}
+          path: final_output/*
           if-no-files-found: error
