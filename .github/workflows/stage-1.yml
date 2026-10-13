@@ -22,12 +22,29 @@ jobs:
 
       - name: Build FFmpeg package
         run: |
+          # -I installs ffmpeg's dependencies. Do NOT pass -d: it skips building the package
+          # itself and emits only *_dbg symbol packages, which left the payload missing every
+          # runtime library (libx264, libx265, libvpx, libass, libssl, ...). Stage 2 can only
+          # package the .deb files that appear in output/, so they must be the real ones.
           ./scripts/run-docker.sh \
-            ./build-package.sh -I -a "${{ matrix.arch }}" -d ffmpeg
+            ./build-package.sh -I -a "${{ matrix.arch }}" ffmpeg
+
+      - name: Verify real runtime packages were produced
+        run: |
+          echo "Deb packages built: $(find output/ -name '*.deb' | wc -l)"
+          find output/ -name '*.deb' -printf '  %f\n' | sort | head -n 80
+          if [ -z "$(find output/ -name '*.deb' ! -name '*-dbg_*' -print -quit)" ]; then
+            echo "::error::only -dbg symbol packages were built - ffmpeg's runtime libraries would be missing"
+            exit 1
+          fi
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-${{ matrix.arch }}
-          path: output/*.deb
+          # Debug symbol packages are not loadable at runtime; excluding them keeps Stage 2
+          # from treating a -dbg deb as evidence that a dependency was actually built.
+          path: |
+            output/*.deb
+            !output/*-dbg_*.deb
           if-no-files-found: error
