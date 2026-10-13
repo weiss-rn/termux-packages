@@ -23,7 +23,7 @@ jobs:
       - name: Build FFmpeg package
         run: |
           ./scripts/run-docker.sh \
-            ./build-package.sh -I -a "${{ matrix.arch }}" ffmpeg
+            ./build-package.sh -I -a "${{ matrix.arch }}" -d ffmpeg
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
