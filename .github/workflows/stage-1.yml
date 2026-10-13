@@ -20,6 +20,68 @@ jobs:
           repository: termux/termux-packages
           ref: master
 
+      # actions/checkout with a foreign repository replaces the workspace with that
+      # repository's tree, so a file stored in this workflow's repo is not present in the
+      # runner - and therefore not in the container either. Writing it here, after checkout,
+      # is what puts it on the bind mount that run-docker.sh shares with the container.
+      # Keep this in sync with capture-libs.sh at the repo root.
+      - name: Write library capture script
+        run: |
+          cat > capture-libs.sh <<'CAPTURE_EOF'
+          #!/usr/bin/env bash
+          #
+          # Runs INSIDE the termux-packages build container (driven by scripts/run-docker.sh).
+          #
+          # Why this exists
+          # ---------------
+          # build-package.sh installs ffmpeg's dependencies into $TERMUX_PREFIX so that ffmpeg
+          # can link against them, but only ffmpeg's own .deb is ever written to output/. The
+          # dependency packages (x264, x265, vpx, dav1d, aom, ass, freetype, openssl, ocl-icd,
+          # ...) are fetched as prebuilt debs inside the container and are not emitted as build
+          # output, so stage 1's `path: output/*.deb` can only ever yield ffmpeg and libwebp.
+          # No combination of build-package.sh flags changes that.
+          #
+          # The dependency libraries therefore exist in exactly one place: as files in
+          # $TERMUX_PREFIX/lib. Tarring that directory is the only way to get them out, and it
+          # has to happen while the container is still alive - every run-docker.sh invocation
+          # is a fresh container, so a separate step afterwards would find an empty prefix.
+          #
+          # This mirrors what produced the working 7.1.1 payload, whose 184 entries are a
+          # verbatim dump of the prefix lib directory rather than a hand-picked closure.
+          #
+          # Usage: bash ./capture-libs.sh <aarch64|arm|i686|x86_64>
+
+          set -euo pipefail
+
+          ARCH="${1:?usage: capture-libs.sh <aarch64|arm|i686|x86_64>}"
+
+          ./build-package.sh -I -a "$ARCH" ffmpeg
+
+          PREFIX="${TERMUX_PREFIX:-/data/data/com.termux/files/usr}"
+          LIB_DIR="$PREFIX/lib"
+
+          if [ ! -d "$LIB_DIR" ]; then
+            echo "::error::Termux lib directory not found at $LIB_DIR" >&2
+            exit 1
+          fi
+
+          mkdir -p output
+
+          echo "Termux prefix : $PREFIX"
+          echo "Shared objects: $(find "$LIB_DIR" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) | wc -l)"
+
+          # Symlinks are stored as symlinks, which is tar's default. Do not pass -h:
+          # libavcodec.so points at libavcodec.so.62 and the dynamic loader resolves the
+          # versioned SONAME, so both the link name and its target have to survive. FFmpeg.kt
+          # recreates them from the zip metadata when unzipping.
+          tar -C "$LIB_DIR" -cf "output/termux-libs-$ARCH.tar" .
+
+          echo "Archive       : $(tar -tf "output/termux-libs-$ARCH.tar" | wc -l) entries"
+          ls -lh output/
+          CAPTURE_EOF
+          echo "Wrote capture-libs.sh ($(wc -l < capture-libs.sh) lines)"
+          bash -n capture-libs.sh
+
       - name: Build FFmpeg package and capture its library closure
         run: ./scripts/run-docker.sh bash ./capture-libs.sh "${{ matrix.arch }}"
 
