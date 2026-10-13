@@ -1,0 +1,140 @@
+name: Stage 2 - Package FFmpeg for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run ID of Stage 1 (leave blank to use latest successful run)'
+        required: false
+        default: ''
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, arm, i686, x86_64]
+
+    steps:
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y binutils zip
+
+      # Grabs the artifact from Stage 1 automatically
+      - name: Download Stage 1 deb artifacts
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: stage-1.yml
+          workflow_conclusion: success
+          run_id: ${{ inputs.run_id }}       # Uses input if specified, otherwise latest success
+          name: ffmpeg-${{ matrix.arch }}
+          path: debs/
+
+      - name: Extract debs and prepare Android .so files
+        shell: bash
+        run: |
+          mkdir -p extracted staging staging_zip/usr/lib final_output
+
+          echo "Deb packages found:"
+          ls -la debs/
+
+          # 1. Extract all .deb files from Stage 1
+          find debs/ -type f -name "*.deb" -exec dpkg-deb -x {} extracted/ \;
+
+          # 2. Locate the Termux usr folder
+          USR_DIR="extracted/data/data/com.termux/files/usr"
+          if [ ! -d "$USR_DIR" ]; then
+            echo "Fallback: finding usr folder dynamically..."
+            USR_DIR=$(find extracted -type d -name "usr" | head -n 1)
+          fi
+          echo "Using USR_DIR: $USR_DIR"
+
+          # 3. Create libffmpeg.so and libffprobe.so
+          if [ ! -f "$USR_DIR/bin/ffmpeg" ]; then
+            echo "::error::ffmpeg binary not found in $USR_DIR/bin/"
+            exit 1
+          fi
+
+          cp "$USR_DIR/bin/ffmpeg" staging/libffmpeg.so
+          cp "$USR_DIR/bin/ffprobe" staging/libffprobe.so
+
+          # Strip debug symbols to reduce APK size significantly
+          strip --strip-unneeded staging/libffmpeg.so staging/libffprobe.so || true
+
+          # 4. Create libffmpeg.zip.so containing runtime shared libraries
+          #
+          # The ffmpeg binary links against 60+ libraries that Termux ships as *separate*
+          # packages (x264, x265, vpx, dav1d, aom, ass, freetype, openssl, ...). Stage 1
+          # downloads every one of those .deb files, and the loop above extracts all of them,
+          # so the libs are already on disk under extracted/. Copying only "$USR_DIR"/lib/*.so*
+          # gathered ffmpeg's own libraries (28 entries) and silently dropped the rest - the
+          # resulting libavcodec.so failed to load at runtime because libx264.so.164 and
+          # dozens of siblings were absent.
+          #
+          # Preserve symlinks with -P: libavcodec.so is a symlink to libavcodec.so.62, and the
+          # SONAME the loader looks up is the versioned file, so both forms must be carried over.
+          LIB_DIR="$USR_DIR/lib"
+          if [ -d "$LIB_DIR" ]; then
+            find "$LIB_DIR" -maxdepth 1 \
+              \( -name '*.so' -o -name '*.so.*' \) \
+              -exec cp -P {} staging_zip/usr/lib/ \;
+          fi
+
+          # Termux splits some runtime libs into lib/ and keep others in the per-package
+          # payload, so sweep every extracted package as well rather than trusting one dir.
+          while IFS= read -r lib; do
+            [ -e "$lib" ] || continue
+            cp -P "$lib" staging_zip/usr/lib/ 2>/dev/null || true
+          done < <(find extracted/data/data/com.termux/files/usr/lib -maxdepth 1 \
+                     \( -name '*.so' -o -name '*.so.*' \) 2>/dev/null)
+
+          echo "Libraries packaged: $(find staging_zip/usr/lib \( -type f -o -type l \) | wc -l)"
+
+          cd staging_zip
+          zip -y -r ../staging/libffmpeg.zip.so usr/
+          cd ..
+
+          # Fail loudly if any DT_NEEDED entry cannot be satisfied by the payload. This is the
+          # defect that produced a silently broken ffmpeg: the archive was built, the workflow
+          # went green, and libavcodec.so only failed at load time on the user's device.
+          echo "Checking DT_NEEDED closure..."
+          : > missing.txt
+          # Redirect into a file rather than piping: a `while` inside a pipe runs in a subshell,
+          # so the loop body could not signal failure back to the step.
+          for so in staging_zip/usr/lib/*.so.* staging_zip/usr/lib/*.so; do
+            [ -e "$so" ] || continue
+            # Only real ELF files carry DT_NEEDED; symlinks and non-ELFs must be skipped.
+            head -c 4 "$so" 2>/dev/null | grep -q 'ELF' || continue
+            readelf -d "$so" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' \
+              | while read -r dep; do
+                  [ -n "$dep" ] || continue
+                  # Platform libs come from Android itself, not from this payload.
+                  case "$dep" in
+                    libm.so|libc.so|libdl.so|liblog.so|libz.so.1|libz.so|libandroid.so) continue ;;
+                  esac
+                  [ -e "staging_zip/usr/lib/$dep" ] \
+                    || echo "MISSING: $dep (needed by $(basename "$so"))" >> missing.txt
+                done
+          done
+          if [ -s missing.txt ]; then
+            echo "::error::$(wc -l < missing.txt) unresolved shared library dependencies - ffmpeg would fail to load"
+            sort -u missing.txt
+            exit 1
+          fi
+          echo "Dependency closure satisfied."
+
+          # 5. Move final artifacts to destination
+          cp staging/libffmpeg.so final_output/
+          cp staging/libffprobe.so final_output/
+          cp staging/libffmpeg.zip.so final_output/
+
+          echo "Final packaged files:"
+          ls -lh final_output/
+
+      - name: Upload Native Android Binaries (.so)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-android-${{ matrix.arch }}
+          path: final_output/*
+          if-no-files-found: error
