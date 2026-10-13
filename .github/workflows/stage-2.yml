@@ -90,6 +90,10 @@ jobs:
                      \( -name '*.so' -o -name '*.so.*' \) 2>/dev/null)
 
           echo "Libraries packaged: $(find staging_zip/usr/lib \( -type f -o -type l \) | wc -l)"
+          echo ".deb packages consumed: $(find debs/ -type f -name '*.deb' | wc -l)"
+          # Surfacing this makes an incomplete Stage 1 obvious: if only the ffmpeg package was
+          # downloaded, every dependency below will be reported missing.
+          find debs/ -type f -name '*.deb' -printf '  %f\n' | sort | head -n 60
 
           cd staging_zip
           zip -y -r ../staging/libffmpeg.zip.so usr/
@@ -118,8 +122,11 @@ jobs:
                 done
           done
           if [ -s missing.txt ]; then
-            echo "::error::$(wc -l < missing.txt) unresolved shared library dependencies - ffmpeg would fail to load"
-            sort -u missing.txt
+            # Dedupe: one absent library can be needed by many binaries, and the raw count
+            # overstates how many packages are actually missing.
+            sort -u missing.txt -o missing.txt
+            echo "::error::$(wc -l < missing.txt) distinct shared libraries unresolved - ffmpeg would fail to load"
+            cat missing.txt
             exit 1
           fi
           echo "Dependency closure satisfied."
