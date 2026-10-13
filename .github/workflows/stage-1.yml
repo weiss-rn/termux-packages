@@ -20,23 +20,30 @@ jobs:
           repository: termux/termux-packages
           ref: master
 
-      - name: Build FFmpeg package
-        run: |
-          # -I installs ffmpeg's dependencies. Do NOT pass -d: it skips building the package
-          # itself and emits only *_dbg symbol packages, which left the payload missing every
-          # runtime library (libx264, libx265, libvpx, libass, libssl, ...). Stage 2 can only
-          # package the .deb files that appear in output/, so they must be the real ones.
-          ./scripts/run-docker.sh \
-            ./build-package.sh -I -a "${{ matrix.arch }}" ffmpeg
+      - name: Build FFmpeg package and capture its library closure
+        run: ./scripts/run-docker.sh bash ./capture-libs.sh "${{ matrix.arch }}"
 
-      - name: Verify real runtime packages were produced
+      - name: Verify the build produced a usable payload
         run: |
           echo "Deb packages built: $(find output/ -name '*.deb' | wc -l)"
           find output/ -name '*.deb' -printf '  %f\n' | sort | head -n 80
+
+          # Passing -d to build-package.sh makes it skip the package itself and emit only
+          # *_dbg symbol packages, which leaves every runtime library missing.
           if [ -z "$(find output/ -name '*.deb' ! -name '*-dbg_*' -print -quit)" ]; then
             echo "::error::only -dbg symbol packages were built - ffmpeg's runtime libraries would be missing"
             exit 1
           fi
+
+          # The dependency libraries never reach output/ as .deb files; they are only ever
+          # present inside the container's Termux prefix. Without this archive Stage 2 has
+          # nothing to build a complete payload from.
+          if [ -z "$(find output/ -name 'termux-libs-*.tar' -print -quit)" ]; then
+            echo "::error::library closure archive missing - Stage 2 would package an incomplete payload"
+            exit 1
+          fi
+
+          ls -lh output/termux-libs-*.tar
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
@@ -47,4 +54,5 @@ jobs:
           path: |
             output/*.deb
             !output/*-dbg_*.deb
+            output/termux-libs-*.tar
           if-no-files-found: error
