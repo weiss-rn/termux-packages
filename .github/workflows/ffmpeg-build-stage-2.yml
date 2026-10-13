@@ -1,0 +1,58 @@
+
+name: Build FFmpeg for Android
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, arm, i686, x86_64]
+
+    steps:
+      - name: Checkout Termux build system
+        uses: actions/checkout@v4
+        with:
+          repository: termux/termux-packages
+          ref: master
+
+      - name: Build FFmpeg
+        shell: bash
+        run: |
+          cat > build-ffmpeg.sh <<'SCRIPT'
+          #!/bin/bash
+          set -e
+          export TERMUX_ARCH="${{ matrix.arch }}"
+          export TERMUX_PREFIX=/data/youtubedl-android/usr
+          export TERMUX_ANDROID_HOME=/data/youtubedl-android/home
+          ./build-package.sh ffmpeg
+          SCRIPT
+
+          chmod +x build-ffmpeg.sh
+          ./scripts/run-docker.sh ./clean.sh
+          ./scripts/run-docker.sh ./build-ffmpeg.sh
+
+      - name: Extract FFmpeg packages
+        shell: bash
+        run: |
+          mkdir -p extracted
+          find debs -type f -name '*.deb' \
+            ! -name '*-dev_*.deb' \
+            ! -name '*-static_*.deb' \
+            -exec dpkg-deb -x '{}' extracted/ \;
+
+          mkdir -p output
+          cd extracted/data/youtubedl-android
+          rm -rf usr/share/man
+          zip -y -r "../../../../../output/ffmpeg-${{ matrix.arch }}.zip" usr/
+
+      - name: Upload FFmpeg archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.arch }}
+          path: output/*.zip
+          if-no-files-found: error
